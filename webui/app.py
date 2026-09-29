@@ -12,14 +12,20 @@ import datetime
 warnings.filterwarnings('ignore')
 
 # Add project root directory to path
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_KRONOS_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _KRONOS_ROOT not in sys.path:
+    sys.path.insert(0, _KRONOS_ROOT)
+print(f"[Kronos] Root path added: {_KRONOS_ROOT}")
 
 try:
     from model import Kronos, KronosTokenizer, KronosPredictor
     MODEL_AVAILABLE = True
-except ImportError:
+    print("[Kronos] Model import: SUCCESS")
+except Exception as _e:
+    import traceback as _tb
     MODEL_AVAILABLE = False
-    print("Warning: Kronos model cannot be imported, will use simulated data for demonstration")
+    print(f"[Kronos] Model import FAILED: {type(_e).__name__}: {_e}")
+    _tb.print_exc()
 
 app = Flask(__name__)
 CORS(app)
@@ -427,55 +433,57 @@ def predict():
             return jsonify({'error': f'Insufficient data length, need at least {lookback} rows'}), 400
         
         # Perform prediction
+        required_cols = ['open', 'high', 'low', 'close']
+        if 'volume' in df.columns:
+            required_cols.append('volume')
+
+        start_date = data.get('start_date')
+
+        # Helper: prepare x_df and timestamps depending on start_date or latest
+        if start_date:
+            start_dt = pd.to_datetime(start_date)
+            # normalize timezone awareness between df timestamps and start_dt to avoid comparison errors
+            try:
+                if pd.api.types.is_datetime64tz_dtype(df['timestamps'].dtype):
+                    tz = df['timestamps'].dt.tz
+                    if start_dt.tzinfo is None:
+                        start_dt = start_dt.tz_localize(tz)
+                    else:
+                        start_dt = start_dt.tz_convert(tz)
+                else:
+                    # df timestamps are tz-naive
+                    if start_dt.tzinfo is not None:
+                        try:
+                            start_dt = start_dt.tz_convert(None)
+                        except Exception:
+                            start_dt = start_dt.tz_localize(None)
+            except Exception:
+                # fallback: coerce both to naive timestamps
+                start_dt = pd.to_datetime(str(start_dt)).tz_localize(None) if hasattr(start_dt, 'tzinfo') else pd.to_datetime(start_dt)
+            mask = df['timestamps'] >= start_dt
+            time_range_df = df[mask]
+            if len(time_range_df) < lookback + pred_len:
+                return jsonify({'error': f'Insufficient data from start time {start_dt.strftime("%Y-%m-%d %H:%M")}, need at least {lookback + pred_len} data points, currently only {len(time_range_df)} available'}), 400
+            x_df = time_range_df.iloc[:lookback][required_cols]
+            x_timestamp = time_range_df.iloc[:lookback]['timestamps']
+            y_timestamp = time_range_df.iloc[lookback:lookback+pred_len]['timestamps']
+            prediction_type_prefix = f"(within selected window starting {start_dt.date()})"
+            historical_start_idx = df[mask].index[0] if len(df[mask]) > 0 else 0
+        else:
+            x_df = df.iloc[:lookback][required_cols]
+            x_timestamp = df.iloc[:lookback]['timestamps']
+            y_timestamp = df.iloc[lookback:lookback+pred_len]['timestamps']
+            prediction_type_prefix = "(latest data)"
+            historical_start_idx = 0
+
+        # If real model is available, call it; otherwise generate a simulated forecast
         if MODEL_AVAILABLE and predictor is not None:
             try:
-                # Use real Kronos model
-                # Only use necessary columns: OHLCV, excluding amount
-                required_cols = ['open', 'high', 'low', 'close']
-                if 'volume' in df.columns:
-                    required_cols.append('volume')
-                
-                # Process time period selection
-                start_date = data.get('start_date')
-                
-                if start_date:
-                    # Custom time period - fix logic: use data within selected window
-                    start_dt = pd.to_datetime(start_date)
-                    
-                    # Find data after start time
-                    mask = df['timestamps'] >= start_dt
-                    time_range_df = df[mask]
-                    
-                    # Ensure sufficient data: lookback + pred_len
-                    if len(time_range_df) < lookback + pred_len:
-                        return jsonify({'error': f'Insufficient data from start time {start_dt.strftime("%Y-%m-%d %H:%M")}, need at least {lookback + pred_len} data points, currently only {len(time_range_df)} available'}), 400
-                    
-                    # Use first lookback data points within selected window for prediction
-                    x_df = time_range_df.iloc[:lookback][required_cols]
-                    x_timestamp = time_range_df.iloc[:lookback]['timestamps']
-                    
-                    # Use last pred_len data points within selected window as actual values
-                    y_timestamp = time_range_df.iloc[lookback:lookback+pred_len]['timestamps']
-                    
-                    # Calculate actual time period length
-                    start_timestamp = time_range_df['timestamps'].iloc[0]
-                    end_timestamp = time_range_df['timestamps'].iloc[lookback+pred_len-1]
-                    time_span = end_timestamp - start_timestamp
-                    
-                    prediction_type = f"Kronos model prediction (within selected window: first {lookback} data points for prediction, last {pred_len} data points for comparison, time span: {time_span})"
-                else:
-                    # Use latest data
-                    x_df = df.iloc[:lookback][required_cols]
-                    x_timestamp = df.iloc[:lookback]['timestamps']
-                    y_timestamp = df.iloc[lookback:lookback+pred_len]['timestamps']
-                    prediction_type = "Kronos model prediction (latest data)"
-                
-                # Ensure timestamps are Series format, not DatetimeIndex, to avoid .dt attribute error in Kronos model
                 if isinstance(x_timestamp, pd.DatetimeIndex):
                     x_timestamp = pd.Series(x_timestamp, name='timestamps')
                 if isinstance(y_timestamp, pd.DatetimeIndex):
                     y_timestamp = pd.Series(y_timestamp, name='timestamps')
-                
+
                 pred_df = predictor.predict(
                     df=x_df,
                     x_timestamp=x_timestamp,
@@ -485,11 +493,45 @@ def predict():
                     top_p=top_p,
                     sample_count=sample_count
                 )
-                
+                prediction_type = f"Kronos model prediction {prediction_type_prefix}"
             except Exception as e:
                 return jsonify({'error': f'Kronos model prediction failed: {str(e)}'}), 500
         else:
-            return jsonify({'error': 'Kronos model not loaded, please load model first'}), 400
+            # Simulated prediction: simple random-walk / noise continuation based on last observed prices
+            recent = x_df.copy().reset_index(drop=True)
+            last_close = float(recent['close'].iloc[-1])
+            rng = np.random.default_rng(seed=42)
+            # small relative noise
+            noise_scale = max(1e-4, (recent['close'].pct_change().abs().mean() or 0.001))
+            opens, highs, lows, closes, volumes, amounts = [], [], [], [], [], []
+            prev_close = last_close
+            avg_volume = float(recent['volume'].mean()) if 'volume' in recent.columns else 0
+            for i in range(pred_len):
+                pct = rng.normal(0, noise_scale)
+                close = max(0.0, prev_close * (1 + pct))
+                # make OHLC around close
+                o = prev_close
+                h = max(o, close) * (1 + abs(rng.normal(0, noise_scale/2)))
+                l = min(o, close) * (1 - abs(rng.normal(0, noise_scale/2)))
+                v = float(max(0, avg_volume * (1 + rng.normal(0, 0.1)))) if avg_volume > 0 else 0
+                a = close * v
+                opens.append(o)
+                highs.append(h)
+                lows.append(l)
+                closes.append(close)
+                volumes.append(v)
+                amounts.append(a)
+                prev_close = close
+
+            pred_df = pd.DataFrame({
+                'open': opens,
+                'high': highs,
+                'low': lows,
+                'close': closes,
+                'volume': volumes,
+                'amount': amounts
+            })
+            prediction_type = f"Simulated prediction {prediction_type_prefix}"
         
         # Prepare actual data for comparison (if exists)
         actual_data = []
@@ -500,7 +542,22 @@ def predict():
             # Prediction uses first 400 data points within selected window
             # Actual data should be last 120 data points within selected window
             start_dt = pd.to_datetime(start_date)
-            
+            # normalize timezone as above
+            try:
+                if pd.api.types.is_datetime64tz_dtype(df['timestamps'].dtype):
+                    tz = df['timestamps'].dt.tz
+                    if start_dt.tzinfo is None:
+                        start_dt = start_dt.tz_localize(tz)
+                    else:
+                        start_dt = start_dt.tz_convert(tz)
+                else:
+                    if start_dt.tzinfo is not None:
+                        try:
+                            start_dt = start_dt.tz_convert(None)
+                        except Exception:
+                            start_dt = start_dt.tz_localize(None)
+            except Exception:
+                start_dt = pd.to_datetime(str(start_dt)).tz_localize(None) if hasattr(start_dt, 'tzinfo') else pd.to_datetime(start_dt)
             # Find data starting from start_date
             mask = df['timestamps'] >= start_dt
             time_range_df = df[mask]
@@ -539,6 +596,21 @@ def predict():
         if start_date:
             # Custom time period: find starting position of historical data in original df
             start_dt = pd.to_datetime(start_date)
+            try:
+                if pd.api.types.is_datetime64tz_dtype(df['timestamps'].dtype):
+                    tz = df['timestamps'].dt.tz
+                    if start_dt.tzinfo is None:
+                        start_dt = start_dt.tz_localize(tz)
+                    else:
+                        start_dt = start_dt.tz_convert(tz)
+                else:
+                    if start_dt.tzinfo is not None:
+                        try:
+                            start_dt = start_dt.tz_convert(None)
+                        except Exception:
+                            start_dt = start_dt.tz_localize(None)
+            except Exception:
+                start_dt = pd.to_datetime(str(start_dt)).tz_localize(None) if hasattr(start_dt, 'tzinfo') else pd.to_datetime(start_dt)
             mask = df['timestamps'] >= start_dt
             historical_start_idx = df[mask].index[0] if len(df[mask]) > 0 else 0
         else:
@@ -705,4 +777,4 @@ if __name__ == '__main__':
     else:
         print("Tip: Will use simulated data for demonstration")
     
-    app.run(debug=True, host='0.0.0.0', port=7070)
+    app.run(debug=False, host='0.0.0.0', port=7070, use_reloader=False)
